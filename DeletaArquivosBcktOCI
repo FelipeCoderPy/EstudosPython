@@ -1,0 +1,29 @@
+import oci
+
+config = {
+    "user": "ocid1.user.oc1..aaaaaaaawgn2nn7vvsynzuswbz6mc6lfmsil5lkp4kpzfnwjllzsm4annulq",
+    "key_file": r"C:\Users\fecsantos\oci\felipe.costa@novaquest.com.br_2025-04-15T20_04_46.395Z.pem",
+    "fingerprint": "a6:5e:6f:37:62:de:80:8f:4a:eb:af:22:00:8b:3f:60",
+    "tenancy": "ocid1.tenancy.oc1..aaaaaaaa7ku32scdbd6dfdcb5k4336gbl4l3kcy3y2xd6jodhzx3eg5nm7qa",
+    "region": "sa-saopaulo-1"
+}
+
+bucket_name = "BckOlosCloud"
+prefixo = "cloudAgentStateRawData-20250710"   
+extensao = ".csv"      
+
+object_storage = oci.object_storage.ObjectStorageClient(config)
+namespace = object_storage.get_namespace().data
+
+objetos = object_storage.list_objects(namespace, bucket_name, prefix=prefixo).data.objects
+
+contador = 0
+for obj in objetos:
+    nome = obj.name
+    if nome.endswith(extensao):  
+        print(f"Deletando: {nome}")
+        object_storage.delete_object(namespace, bucket_name, nome)
+        contador += 1
+
+print(f" Total de arquivos deletados: {contador}")
+ 
