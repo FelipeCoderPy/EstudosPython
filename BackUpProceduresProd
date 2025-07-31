@@ -1,0 +1,77 @@
+import mysql.connector
+import os
+from datetime import datetime
+
+# Diretório onde os arquivos serão salvos
+BACKUP_DIR = r'\\omega\GECOP\RESULTADOS\05. Backup Procedures MYSQL (172.25.100.14)'
+
+# Conexão com o MySQL
+conn = mysql.connector.connect(
+    host='172.25.100.14',
+    user='fecsantos',
+    password='@Fec13022025'
+)
+cursor = conn.cursor()
+
+# Data e hora no formato AAAA-MM-DD_HHMM
+timestamp_str = datetime.now().strftime('%Y-%m-%d_%H%M')
+
+# Buscar todos os bancos de dados
+cursor.execute("SHOW DATABASES")
+databases = [row[0] for row in cursor.fetchall()]
+
+# Ignorar bancos do sistema
+system_dbs = {'information_schema', 'mysql', 'performance_schema', 'sys'}
+
+for db in databases:
+    if db in system_dbs:
+        continue
+
+    print(f"\n📁 Processando banco: {db}")
+    
+    # Criar diretório por banco
+    db_dir = os.path.join(BACKUP_DIR, db)
+    os.makedirs(db_dir, exist_ok=True)
+
+    # Mudar para o banco atual
+    cursor.execute(f"USE `{db}`")
+
+    # Buscar procedures
+    cursor.execute("SHOW PROCEDURE STATUS WHERE Db = %s", (db,))
+    procedures = cursor.fetchall()
+    print(f"🔍 Encontradas {len(procedures)} procedures no banco {db}")
+
+    for proc in procedures:
+        proc_name = proc[1]
+        print(f"   - Exportando procedure: {proc_name}")
+        
+        try:
+            cursor.execute(f"SHOW CREATE PROCEDURE `{proc_name}`")
+            result = cursor.fetchone()
+            print(f"     → Resultado do SHOW CREATE: {result is not None}")
+            
+            if result:
+                try:
+                    definition = result[2]
+                except IndexError:
+                    definition = result[1]
+
+                # Nome e caminho do arquivo com data e hora
+                filename = f"{proc_name}_{timestamp_str}.txt"
+                filepath = os.path.join(db_dir, filename)
+                print(f"     → Salvando em: {filepath}")
+
+                try:
+                    with open(filepath, 'w', encoding='utf-8') as f:
+                        f.write(definition)
+                    print(f"     ✔ Procedure {proc_name} salva com sucesso.")
+                except Exception as e:
+                    print(f"     ❌ Erro ao salvar {filepath}: {e}")
+        except Exception as e:
+            print(f"     ❌ Erro ao obter definição da procedure {proc_name}: {e}")
+
+# Encerrar conexão
+cursor.close()
+conn.close()
+
+print("\n✅ Backup das procedures concluído.")
