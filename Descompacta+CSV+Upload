@@ -1,0 +1,91 @@
+import os
+import zipfile
+import oci
+import time
+
+# === CONFIG ===
+pasta_zip = r'C:\Users\fecsantos\Desktop\cloudAttemptsRawData-202506'
+pasta_destino = r'C:\Users\fecsantos\Desktop\Destino3'
+bucket_name = "BckOlosCloud"
+
+config = {
+    "user": "ocid1.user.oc1..aaaaaaaawgn2nn7vvsynzuswbz6mc6lfmsil5lkp4kpzfnwjllzsm4annulq",
+    "key_file": r"C:\Users\fecsantos\oci\felipe.costa@novaquest.com.br_2025-04-15T20_04_46.395Z.pem",
+    "fingerprint": "a6:5e:6f:37:62:de:80:8f:4a:eb:af:22:00:8b:3f:60",
+    "tenancy": "ocid1.tenancy.oc1..aaaaaaaa7ku32scdbd6dfdcb5k4336gbl4l3kcy3y2xd6jodhzx3eg5nm7qa",
+    "region": "sa-saopaulo-1"
+}
+
+os.makedirs(pasta_destino, exist_ok=True)
+
+# OCI
+from oci.config import validate_config
+validate_config(config)
+object_storage = oci.object_storage.ObjectStorageClient(config)
+namespace = object_storage.get_namespace().data
+
+# === LOOP ZIPs ===
+for arquivo_zip in os.listdir(pasta_zip):
+    caminho_zip = os.path.join(pasta_zip, arquivo_zip)
+
+    if not zipfile.is_zipfile(caminho_zip):
+        print(f"❌ Ignorado (não é zip): {arquivo_zip}")
+        continue
+
+    print(f"\n📦 Processando ZIP: {arquivo_zip}")
+
+    # Limpa pasta destino antes de extrair
+    for f in os.listdir(pasta_destino):
+        try:
+            os.remove(os.path.join(pasta_destino, f))
+        except:
+            pass
+
+    # Extrai com tratamento de erro
+    try:
+        with zipfile.ZipFile(caminho_zip, 'r') as zip_ref:
+            zip_ref.extractall(pasta_destino)
+    except Exception as e:
+        print(f"❌ Erro ao extrair '{arquivo_zip}': {e}")
+        continue
+
+    # Processa arquivos extraídos
+    for nome_arquivo in os.listdir(pasta_destino):
+        caminho_antigo = os.path.join(pasta_destino, nome_arquivo)
+        if not os.path.isfile(caminho_antigo):
+            continue
+
+        # Renomear
+        nome_sem_extensao, _ = os.path.splitext(nome_arquivo)
+        novo_nome = nome_sem_extensao + ".csv"
+        caminho_novo = os.path.join(pasta_destino, novo_nome)
+        os.rename(caminho_antigo, caminho_novo)
+        print(f"📄 Renomeado: {nome_arquivo} -> {novo_nome}")
+
+        # Envio com retry
+        max_tentativas = 3
+        tentativa = 0
+        sucesso = False
+
+        while tentativa < max_tentativas and not sucesso:
+            try:
+                with open(caminho_novo, "rb") as f:
+                    put_response = object_storage.put_object(
+                        namespace_name=namespace,
+                        bucket_name=bucket_name,
+                        object_name=novo_nome,
+                        put_object_body=f
+                    )
+                print(f"✅ Upload OK: {novo_nome} (ETag: {put_response.headers.get('ETag')})")
+
+                os.remove(caminho_novo)
+                print(f"🗑️ Arquivo deletado: {novo_nome}")
+                sucesso = True
+
+            except Exception as e:
+                tentativa += 1
+                print(f"⚠️ Tentativa {tentativa} falhou: {e}")
+                if tentativa < max_tentativas:
+                    time.sleep(5)
+                else:
+                    print(f"❌ Falha definitiva no upload de '{novo_nome}'. Mantido na pasta para revisão.")
