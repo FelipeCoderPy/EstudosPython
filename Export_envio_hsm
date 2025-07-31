@@ -1,0 +1,65 @@
+import pymysql
+import pyodbc
+import pandas as pd
+from datetime import datetime
+from math import ceil
+
+# SQL Server
+conn_sql = pyodbc.connect(
+    "DRIVER={ODBC Driver 17 for SQL Server};SERVER=192.168.4.193;DATABASE=db_robbu;UID=fecsantos;PWD=dYAvWcBZe2GspzQZBIg1"
+)
+
+# MySQL
+conn_mysql = pymysql.connect(
+    host='172.25.100.14',
+    user='fecsantos',
+    password='@Fec13022025',
+    database='Robbu',
+    charset='utf8mb4',
+    autocommit=False,
+    cursorclass=pymysql.cursors.DictCursor
+)
+
+# Trunca a tabela destino no MySQL
+with conn_mysql.cursor() as cursor_mysql:
+    cursor_mysql.execute("TRUNCATE TABLE envio_hsm_transacional;")
+    conn_mysql.commit()
+    print("Tabela envio_hsm_transacional truncada com sucesso.")
+
+# Data de hoje
+hoje = datetime.now().date()
+
+# Consulta no SQL Server
+query_sql = f"""
+    SELECT * FROM dbo.envio_hsm WITH (NOLOCK)
+    WHERE CAST(dt_inclusao AS DATE) = '{hoje}'
+"""
+
+df = pd.read_sql(query_sql, conn_sql)
+
+if df.empty:
+    print("SEM DADOS....")
+    conn_sql.close()
+    conn_mysql.close()
+    exit()
+
+# Inserção por lote
+batch_size = 50000
+total_batches = ceil(len(df) / batch_size)
+
+cursor_mysql = conn_mysql.cursor()
+colunas = ','.join(f"`{col}`" for col in df.columns)
+placeholders = ','.join(['%s'] * len(df.columns))
+sql_insert = f"INSERT INTO envio_hsm_transacional ({colunas}) VALUES ({placeholders})"
+
+for i in range(total_batches):
+    lote_df = df.iloc[i*batch_size:(i+1)*batch_size]
+    valores = [tuple(row) for row in lote_df.values]
+    cursor_mysql.executemany(sql_insert, valores)
+    conn_mysql.commit()
+    print(f" Lote {i+1}/{total_batches} inserido com sucesso ({len(valores)} registros).")
+
+# Fecha conexões
+cursor_mysql.close()
+conn_sql.close()
+conn_mysql.close()
