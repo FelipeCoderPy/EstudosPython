@@ -1,0 +1,121 @@
+import pyodbc
+import pandas as pd
+import unicodedata
+import os
+from datetime import datetime
+import oci
+from math import ceil
+
+# === Função para remover caracteres de controle ===
+def remover_controle(s):
+    return ''.join(c for c in s if unicodedata.category(c) != 'Cc')
+
+# === Diretório temporário para exportação ===
+diretorio_exportacao = r'C:\ExportAgentStateRawData'
+os.makedirs(diretorio_exportacao, exist_ok=True)
+
+# === Caminho do arquivo com os IDs ausentes ===
+caminho_csv_ids = r'C:\Nova pasta\teste\pks_ausentes.csv'
+
+# === Conexão com o banco SQL Server ===
+servidor = '192.168.4.193'
+banco_de_dados = 'Olos_V3_Sorocaba'
+usuario_sql = 'fecsantos'
+senha_sql = 'dYAvWcBZe2GspzQZBIg1'
+driver = '{ODBC Driver 17 for SQL Server}'
+
+# === Configuração da OCI ===
+config = {
+    "user": "ocid1.user.oc1..aaaaaaaawgn2nn7vvsynzuswbz6mc6lfmsil5lkp4kpzfnwjllzsm4annulq",
+    "key_file": r"C:\Users\fecsantos\oci\felipe.costa@novaquest.com.br_2025-04-15T20_04_46.395Z.pem",
+    "fingerprint": "a6:5e:6f:37:62:de:80:8f:4a:eb:af:22:00:8b:3f:60",
+    "tenancy": "ocid1.tenancy.oc1..aaaaaaaa7ku32scdbd6dfdcb5k4336gbl4l3kcy3y2xd6jodhzx3eg5nm7qa",
+    "region": "sa-saopaulo-1"
+}
+bucket_name = "BckOlosOnPms"
+object_storage = oci.object_storage.ObjectStorageClient(config)
+namespace = object_storage.get_namespace().data
+
+max_linhas_por_arquivo = 500000
+hora_minuto = datetime.now().strftime('%H%M')
+nome_base_arquivo = f'onpmsAgentStateRawData-202505-{hora_minuto}-'
+contador_arquivo = 1
+
+try:
+    # === Leitura dos IDs ausentes do CSV ===
+    df_ids = pd.read_csv(caminho_csv_ids)
+    lista_ids = df_ids['AgentStateRawDataId'].dropna().astype(int).tolist()
+
+    if not lista_ids:
+        raise ValueError("❌ A lista de IDs está vazia. Verifique o arquivo CSV.")
+
+    print(f'🔢 {len(lista_ids)} IDs carregados do arquivo CSV.')
+
+    # === Conectar ao SQL Server ===
+    conexao_str = (
+        f'DRIVER={driver};'
+        f'SERVER={servidor};'
+        f'DATABASE={banco_de_dados};'
+        f'UID={usuario_sql};'
+        f'PWD={senha_sql};'
+    )
+    conexao_sql = pyodbc.connect(conexao_str)
+    cursor_sql = conexao_sql.cursor()
+
+    # === Obter os dados em blocos e concatenar no DataFrame final ===
+    limite_por_lote = 2000
+    total_ids = len(lista_ids)
+    total_lotes = ceil(total_ids / limite_por_lote)
+    df_final = pd.DataFrame()
+
+    for i in range(total_lotes):
+        lote_ids = lista_ids[i * limite_por_lote: (i + 1) * limite_por_lote]
+        placeholders = ','.join(['?'] * len(lote_ids))
+        consulta_sql = f"""
+        SELECT AgentId, CampaignId, AgentStatus, Reason, StartState, EndState, CallId, CallIdTelecom, AgentStateRawDataId, InsertTime 
+        FROM dbo.AgentStateRawData WITH (NOLOCK)
+        WHERE AgentStateRawDataId IN ({placeholders})
+        """
+        cursor_sql.execute(consulta_sql, lote_ids)
+        dados = cursor_sql.fetchall()
+        colunas = [col[0] for col in cursor_sql.description]
+        df_lote = pd.DataFrame.from_records(dados, columns=colunas)
+        df_final = pd.concat([df_final, df_lote], ignore_index=True)
+        print(f"✅ Lote {i+1}/{total_lotes} coletado: {len(dados)} linhas")
+
+    print(f"📦 Total de linhas acumuladas: {len(df_final)}")
+
+    # === Exportar os dados do df_final em arquivos com 500 mil linhas ===
+    total_linhas = len(df_final)
+    for i in range(0, total_linhas, max_linhas_por_arquivo):
+        df_lote_exportacao = df_final.iloc[i:i + max_linhas_por_arquivo]
+        nome_arquivo = f'{nome_base_arquivo}{contador_arquivo}.txt'
+        caminho_arquivo = os.path.join(diretorio_exportacao, nome_arquivo)
+
+        with open(caminho_arquivo, 'w', encoding='utf-8-sig') as arquivo_txt:
+            arquivo_txt.write(';'.join(df_lote_exportacao.columns) + '\n')
+            for linha in df_lote_exportacao.itertuples(index=False):
+                linha_str = ';'.join(str(valor) for valor in linha)
+                arquivo_txt.write(remover_controle(linha_str) + '\n')
+
+        print(f'📁 Arquivo gerado: {nome_arquivo} ({len(df_lote_exportacao)} linhas).')
+
+        with open(caminho_arquivo, "rb") as f:
+            put_response = object_storage.put_object(
+                namespace_name=namespace,
+                bucket_name=bucket_name,
+                object_name=nome_arquivo,
+                put_object_body=f
+            )
+        print(f"✅ Enviado para OCI: {nome_arquivo} (ETag: {put_response.headers.get('ETag')})")
+
+        os.remove(caminho_arquivo)
+        print(f"🗑️ Arquivo local deletado: {nome_arquivo}")
+
+        contador_arquivo += 1
+
+except Exception as e:
+    print(f'❌ Erro: {e}')
+finally:
+    if 'conexao_sql' in locals():
+        conexao_sql.close()
