@@ -1,0 +1,154 @@
+import pyodbc
+import mysql.connector
+from datetime import timedelta
+import os
+import time
+
+# Configuração MySQL (origem)
+source_config_mysql = {
+    'host': '172.25.100.14',
+    'database': 'DataHandling',
+    'user': 'fecsantos',
+    'password': '@Fec13022025'
+}
+
+# Configuração SQL Server (destino)
+dest_config_sqlserver = {
+    'driver': 'ODBC Driver 17 for SQL Server',
+    'server': '192.168.4.193',
+    'database': 'Fornecedores',
+    'uid': 'fecsantos',
+    'pwd': 'dYAvWcBZe2GspzQZBIg1'
+}
+
+mysql_table = 'Discagem_sumarizada'
+sqlserver_schema = 'Geral'
+sqlserver_table = 'Tbl_Discagem_Sumarizada_MYSQL'
+BATCH_SIZE = 50000
+OFFSET_FILE = 'offset_mysql_to_sqlserver.txt'
+
+def get_mysql_connection():
+    return mysql.connector.connect(**source_config_mysql)
+
+def get_sqlserver_connection():
+    conn_str = (
+        f"DRIVER={{{dest_config_sqlserver['driver']}}};"
+        f"SERVER={dest_config_sqlserver['server']};"
+        f"DATABASE={dest_config_sqlserver['database']};"
+        f"UID={dest_config_sqlserver['uid']};"
+        f"PWD={dest_config_sqlserver['pwd']}"
+    )
+    return pyodbc.connect(conn_str)
+
+def get_offset():
+    if os.path.exists(OFFSET_FILE):
+        with open(OFFSET_FILE, 'r') as f:
+            return int(f.read().strip())
+    return 0
+
+def save_offset(offset):
+    with open(OFFSET_FILE, 'w') as f:
+        f.write(str(offset))
+
+def convert_timedelta_in_batch(batch, timedelta_cols):
+    new_batch = []
+    for row in batch:
+        row_list = list(row)
+        for idx in timedelta_cols:
+            val = row_list[idx]
+            if isinstance(val, timedelta):
+                total_seconds = int(val.total_seconds())
+                horas = total_seconds // 3600
+                minutos = (total_seconds % 3600) // 60
+                segundos = total_seconds % 60
+                row_list[idx] = f"{horas:02d}:{minutos:02d}:{segundos:02d}.000"
+        new_batch.append(tuple(row_list))
+    return new_batch
+
+def main():
+    offset = get_offset()
+    print(f"📍 Iniciando a partir do offset: {offset}")
+
+    mysql_conn = get_mysql_connection()
+    mysql_cursor = mysql_conn.cursor()
+
+    sqlserver_conn = get_sqlserver_connection()
+    sqlserver_cursor = sqlserver_conn.cursor()
+
+    # Obtem colunas do MySQL
+    mysql_cursor.execute(f"SHOW COLUMNS FROM {mysql_table}")
+    mysql_cols = [col[0] for col in mysql_cursor.fetchall() if col[0].lower() != 'id']
+
+    # Obtem colunas do SQL Server
+    sqlserver_cursor.execute("""
+        SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+    """, (sqlserver_schema, sqlserver_table))
+    sqlserver_cols_all = [row[0] for row in sqlserver_cursor.fetchall()]
+    sqlserver_cols = [col for col in sqlserver_cols_all if col.lower() in [c.lower() for c in mysql_cols]]
+
+    # Mapeia colunas MySQL -> SQL Server com base nos nomes correspondentes
+    mysql_col_map = {c.lower(): c for c in mysql_cols}
+    matched_cols_mysql = [mysql_col_map[col.lower()] for col in sqlserver_cols]
+    matched_cols_sqlserver = sqlserver_cols
+
+    print(f"🔁 Colunas a transferir: {matched_cols_sqlserver}")
+
+    # Busca total de linhas
+    mysql_cursor.execute(f"SELECT COUNT(*) FROM {mysql_table}")
+    total_rows = mysql_cursor.fetchone()[0]
+    print(f"📊 Total de registros: {total_rows}")
+
+    timedelta_cols = []  # Inicializa aqui para evitar erro
+
+    while offset < total_rows:
+        select_query = f"""
+            SELECT {', '.join(matched_cols_mysql)}
+            FROM {mysql_table}
+            LIMIT {BATCH_SIZE} OFFSET {offset}
+        """
+        mysql_cursor.execute(select_query)
+        rows = mysql_cursor.fetchall()
+
+        if not rows:
+            print("✅ Nenhum dado a mais para transferir.")
+            break
+
+        # Detecta colunas timedelta apenas no primeiro lote
+        if not timedelta_cols:
+            timedelta_cols = [i for i, val in enumerate(rows[0]) if isinstance(val, timedelta)]
+            if timedelta_cols:
+                print(f"🕒 Colunas com timedelta: {timedelta_cols}")
+
+        # Converte timedelta
+        rows = convert_timedelta_in_batch(rows, timedelta_cols)
+
+        # Insere no SQL Server
+        insert_query = f"""
+            INSERT INTO [{sqlserver_schema}].[{sqlserver_table}]
+            ({', '.join(f'[{col}]' for col in matched_cols_sqlserver)})
+            VALUES ({', '.join(['?'] * len(matched_cols_sqlserver))})
+        """
+        sqlserver_cursor.fast_executemany = True
+        sqlserver_cursor.executemany(insert_query, rows)
+        sqlserver_conn.commit()
+
+        offset += len(rows)
+        save_offset(offset)
+        print(f"✅ {offset} registros inseridos com sucesso.")
+
+    # Fecha conexões
+    mysql_cursor.close()
+    mysql_conn.close()
+    sqlserver_cursor.close()
+    sqlserver_conn.close()
+    print("🏁 Transferência concluída.")
+
+if __name__ == '__main__':
+    start = time.time()
+    try:
+        main()
+    except Exception as e:
+        print(f"❌ Erro: {e}")
+    finally:
+        print(f"⏱️ Duração total: {round(time.time() - start, 2)} segundos")
