@@ -1,0 +1,69 @@
+import mysql.connector
+import os
+from datetime import datetime
+
+# Diretório onde os arquivos serão salvos
+BACKUP_DIR = r'\\omega\GECOP\RESULTADOS\06. BackUp CREATE TABLE MYSQL (172.25.100.14)'
+
+# Conexão com o MySQL
+conn = mysql.connector.connect(
+    host='172.25.100.14',
+    user='fecsantos',
+    password='@Fec13022025'
+)
+cursor = conn.cursor()
+
+# Data e hora no formato AAAA-MM-DD_HHMM
+timestamp_str = datetime.now().strftime('%Y-%m-%d_%H%M')
+
+# Buscar todos os bancos de dados
+cursor.execute("SHOW DATABASES")
+databases = [row[0] for row in cursor.fetchall()]
+
+# Ignorar bancos do sistema
+system_dbs = {'information_schema', 'mysql', 'performance_schema', 'sys'}
+
+for db in databases:
+    if db in system_dbs:
+        continue
+
+    print(f"\n📁 Processando banco: {db}")
+    
+    # Criar diretório por banco
+    db_dir = os.path.join(BACKUP_DIR, db)
+    os.makedirs(db_dir, exist_ok=True)
+
+    # Mudar para o banco atual
+    cursor.execute(f"USE `{db}`")
+
+    # Buscar tabelas
+    cursor.execute("SHOW TABLES")
+    tables = [row[0] for row in cursor.fetchall()]
+    print(f"🔍 Encontradas {len(tables)} tabelas no banco {db}")
+
+    for table_name in tables:
+        print(f"   - Exportando tabela: {table_name}")
+        
+        try:
+            cursor.execute(f"SHOW CREATE TABLE `{table_name}`")
+            result = cursor.fetchone()
+            
+            if result:
+                definition = result[1]  # O CREATE TABLE está na segunda posição
+
+                # Nome e caminho do arquivo com data e hora
+                filename = f"{table_name}_{timestamp_str}.txt"
+                filepath = os.path.join(db_dir, filename)
+
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(definition)
+                
+                print(f"     ✔ Tabela {table_name} salva com sucesso.")
+        except Exception as e:
+            print(f"     ❌ Erro ao obter definição da tabela {table_name}: {e}")
+
+# Encerrar conexão
+cursor.close()
+conn.close()
+
+print("\n✅ Backup das tabelas concluído.")
