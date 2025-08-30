@@ -1,0 +1,65 @@
+import pymysql
+import csv
+import os
+
+# Configuração da conexão
+conn = pymysql.connect(
+    host='172.25.100.14',
+    user='fecsantos',
+    password='@Fec13022025',
+    database='OlosCloud',
+    charset='utf8mb4',
+    cursorclass=pymysql.cursors.SSCursor  
+)
+
+query = """SELECT
+    A.cod_tit,
+    LTRIM(RTRIM(
+            REPLACE(
+                REPLACE(
+                    REPLACE(A.contrato, CHAR(13), ''),  -- Remove \r
+                CHAR(10), ''),                           			 -- Remove \n
+            CHAR(9), '')                                 			 -- Remove TAB
+        )) AS contrato
+FROM 
+    `DataStageMercadoPago`.`BaseCobTIT` A
+WHERE
+    NOT EXISTS (
+        SELECT 'X'
+        FROM `DataStageMercadoPago`.`FilesMP` B
+        WHERE A.contrato = B.ID_Cliente
+    );""" 
+
+batch_size = 50000
+file_counter = 1
+
+# Diretório de saída
+output_dir = r'C:\Users\fecsantos\Desktop'  
+os.makedirs(output_dir, exist_ok=True)  
+
+try:
+    with conn.cursor() as cursor:
+        cursor.execute(query)
+        
+        while True:
+            rows = cursor.fetchmany(batch_size)
+            if not rows:
+                break
+
+            filename = os.path.join(output_dir, f'Arquivo_MPCobTit_{file_counter}.csv')
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f, delimiter=';', quoting=csv.QUOTE_NONE, escapechar='\\')
+                
+                # Escrevendo cabeçalho
+                if cursor.description:
+                    header = [col[0] for col in cursor.description]
+                    writer.writerow(header)
+                
+                # Escrevendo linhas
+                writer.writerows(rows)
+            
+            print(f'Lote {file_counter} exportado: {len(rows)} linhas')
+            file_counter += 1
+
+finally:
+    conn.close()
