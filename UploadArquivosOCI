@@ -1,0 +1,50 @@
+import oci
+import os
+
+config = {
+    "user": "ocid1.user.oc1..aaaaaaaawgn2nn7vvsynzuswbz6mc6lfmsil5lkp4kpzfnwjllzsm4annulq",  
+    "key_file": r"C:\Users\fecsantos\oci\felipe.costa@novaquest.com.br_2025-04-15T20_04_46.395Z.pem",  
+    "fingerprint": "a6:5e:6f:37:62:de:80:8f:4a:eb:af:22:00:8b:3f:60",  
+    "tenancy": "ocid1.tenancy.oc1..aaaaaaaa7ku32scdbd6dfdcb5k4336gbl4l3kcy3y2xd6jodhzx3eg5nm7qa",  
+    "region": "sa-saopaulo-1" 
+}
+
+
+# Valida a configuração
+from oci.config import validate_config
+validate_config(config)  # Valida as credenciais (remove se não quiser validar)
+
+# Informações do bucket e diretório
+bucket_name = "BckOlosCloud" 
+local_directory = r"C:\Users\fecsantos\Desktop\Arquivos"  # Caminho do diretório
+
+# Inicializar o cliente Object Storage
+object_storage = oci.object_storage.ObjectStorageClient(config)
+
+# Pega o namespace real
+namespace = object_storage.get_namespace().data
+
+try:
+    for filename in os.listdir(local_directory):
+        file_path = os.path.join(local_directory, filename)
+
+        if os.path.isfile(file_path):
+            object_name = filename
+
+            with open(file_path, "rb") as f:
+                put_response = object_storage.put_object(
+                    namespace_name=namespace,  # ← aqui está corrigido!
+                    bucket_name=bucket_name,
+                    object_name=object_name,
+                    put_object_body=f
+                )
+                print(f"Arquivo '{filename}' enviado com sucesso. ETag: {put_response.headers.get('ETag')}")
+
+
+
+except oci.exceptions.ServiceError as e:
+    print(f"Erro OCI: {e}")
+except FileNotFoundError:
+    print(f"Diretório não encontrado: '{local_directory}'")
+except Exception as e:
+    print(f"Erro inesperado: {e}")
