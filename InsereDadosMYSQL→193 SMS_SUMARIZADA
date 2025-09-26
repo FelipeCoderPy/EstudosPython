@@ -1,0 +1,187 @@
+import pyodbc
+import mysql.connector
+from datetime import timedelta
+import os
+import time
+
+# Configuração MySQL (origem)
+source_config_mysql = {
+    'host': '172.25.100.14',
+    'database': 'DataHandling',
+    'user': 'fecsantos',
+    'password': '@Fec13022025'
+}
+
+# Configuração SQL Server (destino)
+dest_config_sqlserver = {
+    'driver': 'ODBC Driver 17 for SQL Server',
+    'server': '192.168.4.219',
+    'database': 'ReportDataMercadoPago',
+    'uid': 'fecsantos',
+    'pwd': 'dYAvWcBZe2GspzQZBIg1'
+}
+
+mysql_table = 'SMS_Sumarizada'  # CORRIGIDO: Tabela SMS em vez de Email
+sqlserver_schema = 'suma'
+sqlserver_table = 'TblSms'
+BATCH_SIZE = 50000
+OFFSET_FILE = 'offset_sms_sumarizada.txt'
+
+# Colunas específicas a serem transferidas (na ordem desejada)
+COLUNAS_SELECIONADAS = [
+    'IdFornecedor', 'COD_DEV', 'COD_CRED', 'Celular', 'DDD', 'DATA', 
+    'Disparos', 'Erro', 'Enviado', 'Entregue', 'Entregue_Operadora', 
+    'Bloqueado', 'Numero_Invalido', 'CLICK', 'Fail', 'SKIPPED'
+]
+
+def get_mysql_connection():
+    return mysql.connector.connect(**source_config_mysql)
+
+def get_sqlserver_connection():
+    conn_str = (
+        f"DRIVER={{{dest_config_sqlserver['driver']}}};"
+        f"SERVER={dest_config_sqlserver['server']};"
+        f"DATABASE={dest_config_sqlserver['database']};"
+        f"UID={dest_config_sqlserver['uid']};"
+        f"PWD={dest_config_sqlserver['pwd']}"
+    )
+    return pyodbc.connect(conn_str)
+
+def get_offset():
+    if os.path.exists(OFFSET_FILE):
+        with open(OFFSET_FILE, 'r') as f:
+            return int(f.read().strip())
+    return 0
+
+def save_offset(offset):
+    with open(OFFSET_FILE, 'w') as f:
+        f.write(str(offset))
+
+def convert_timedelta_in_batch(batch, timedelta_cols):
+    new_batch = []
+    for row in batch:
+        row_list = list(row)
+        for idx in timedelta_cols:
+            val = row_list[idx]
+            if isinstance(val, timedelta):
+                total_seconds = int(val.total_seconds())
+                horas = total_seconds // 3600
+                minutos = (total_seconds % 3600) // 60
+                segundos = total_seconds % 60
+                row_list[idx] = f"{horas:02d}:{minutos:02d}:{segundos:02d}.000"
+        new_batch.append(tuple(row_list))
+    return new_batch
+
+def verificar_colunas_mysql():
+    """Função para verificar as colunas reais da tabela SMS_Sumarizada"""
+    mysql_conn = get_mysql_connection()
+    mysql_cursor = mysql_conn.cursor()
+    
+    mysql_cursor.execute(f"SHOW COLUMNS FROM {mysql_table}")
+    colunas = [col[0] for col in mysql_cursor.fetchall()]
+    
+    print("🔍 Colunas disponíveis na tabela SMS_Sumarizada:")
+    for coluna in colunas:
+        print(f"   - {coluna}")
+    
+    # Verificar quais colunas solicitadas existem
+    colunas_existentes = [col for col in COLUNAS_SELECIONADAS if col in colunas]
+    colunas_inexistentes = [col for col in COLUNAS_SELECIONADAS if col not in colunas]
+    
+    print(f"\n✅ Colunas que existem: {colunas_existentes}")
+    print(f"❌ Colunas que NÃO existem: {colunas_inexistentes}")
+    
+    mysql_cursor.close()
+    mysql_conn.close()
+    
+    return colunas_existentes
+
+def main():
+    # Primeiro, verificar as colunas disponíveis
+    colunas_validas = verificar_colunas_mysql()
+    
+    if not colunas_validas:
+        print("❌ Nenhuma das colunas solicitadas foi encontrada na tabela!")
+        return
+    
+    offset = get_offset()
+    print(f"📍 Iniciando a partir do offset: {offset}")
+
+    mysql_conn = get_mysql_connection()
+    mysql_cursor = mysql_conn.cursor()
+
+    sqlserver_conn = get_sqlserver_connection()
+    sqlserver_cursor = sqlserver_conn.cursor()
+
+    # Filtro para COD_CRED
+    cod_cred_filtro = [12, 15, 17, 18, 19, 20]
+    placeholders = ','.join(['%s'] * len(cod_cred_filtro))
+
+    print(f"🔍 Filtrando por COD_CRED: {cod_cred_filtro}")
+
+    # Busca total de linhas com filtro
+    count_query = f"""
+        SELECT COUNT(*) FROM {mysql_table} 
+        WHERE COD_CRED IN ({placeholders})
+    """
+    mysql_cursor.execute(count_query, cod_cred_filtro)
+    total_rows = mysql_cursor.fetchone()[0]
+    print(f"📊 Total de registros com filtro: {total_rows}")
+
+    timedelta_cols = []  # Inicializa aqui para evitar erro
+
+    while offset < total_rows:
+        select_query = f"""
+            SELECT {', '.join(colunas_validas)}
+            FROM {mysql_table}
+            WHERE COD_CRED IN ({placeholders})
+            ORDER BY ID  -- Adiciona ordenação para garantir consistência
+            LIMIT {BATCH_SIZE} OFFSET {offset}
+        """
+        
+        mysql_cursor.execute(select_query, cod_cred_filtro)
+        rows = mysql_cursor.fetchall()
+
+        if not rows:
+            print("✅ Nenhum dado a mais para transferir.")
+            break
+
+        # Detecta colunas timedelta apenas no primeiro lote
+        if not timedelta_cols:
+            timedelta_cols = [i for i, val in enumerate(rows[0]) if isinstance(val, timedelta)]
+            if timedelta_cols:
+                print(f"🕒 Colunas com timedelta: {timedelta_cols}")
+
+        # Converte timedelta
+        rows = convert_timedelta_in_batch(rows, timedelta_cols)
+
+        # Insere no SQL Server (usando apenas as colunas válidas)
+        insert_query = f"""
+            INSERT INTO [{sqlserver_schema}].[{sqlserver_table}]
+            ({', '.join(f'[{col}]' for col in colunas_validas)})
+            VALUES ({', '.join(['?'] * len(colunas_validas))})
+        """
+        
+        sqlserver_cursor.fast_executemany = True
+        sqlserver_cursor.executemany(insert_query, rows)
+        sqlserver_conn.commit()
+
+        offset += len(rows)
+        save_offset(offset)
+        print(f"✅ {offset}/{total_rows} registros inseridos com sucesso.")
+
+    # Fecha conexões
+    mysql_cursor.close()
+    mysql_conn.close()
+    sqlserver_cursor.close()
+    sqlserver_conn.close()
+    print("🏁 Transferência concluída.")
+
+if __name__ == '__main__':
+    start = time.time()
+    try:
+        main()
+    except Exception as e:
+        print(f"❌ Erro: {e}")
+    finally:
+        print(f"⏱️ Duração total: {round(time.time() - start, 2)} segundos")
