@@ -1,0 +1,104 @@
+import oci
+from oci.exceptions import ServiceError
+
+def verificar_arquivos_zerados_com_paginacao(config, bucket_name, prefixo, extensao=".csv"):
+    """
+    Verifica arquivos com tamanho zero em um bucket do OCI Object Storage
+    com suporte a paginação para muitos arquivos
+    
+    Args:
+        config: Configuração do OCI
+        bucket_name: Nome do bucket
+        prefixo: Prefixo para filtrar arquivos
+        extensao: Extensão dos arquivos a verificar
+    
+    Returns:
+        Lista de arquivos zerados
+    """
+    try:
+        # Conexão com o Object Storage
+        object_storage = oci.object_storage.ObjectStorageClient(config)
+        namespace = object_storage.get_namespace().data
+        
+        arquivos_zerados = []
+        total_objetos = 0
+        next_start_with = None
+        
+        print(f"Buscando arquivos com prefixo '{prefixo}'...")
+        
+        # Loop de paginação
+        while True:
+            # Listar objetos com paginação
+            list_objects_response = object_storage.list_objects(
+                namespace, 
+                bucket_name, 
+                prefix=prefixo,
+                start=next_start_with
+            )
+            
+            objetos = list_objects_response.data.objects
+            total_objetos += len(objetos)
+            
+            print(f"Processando lote de {len(objetos)} arquivos...")
+            
+            for obj in objetos:
+                nome = obj.name
+                if nome.endswith(extensao):
+                    try:
+                        # Usa head_object para obter metadados sem baixar o conteúdo
+                        response = object_storage.head_object(
+                            namespace, 
+                            bucket_name, 
+                            nome
+                        )
+                        
+                        tamanho = int(response.headers['content-length'])
+                        
+                        if tamanho == 0:
+                            print(f"{nome}")
+                            arquivos_zerados.append(nome)
+                            
+                    except ServiceError as e:
+                        print(f"❌ Erro ao acessar {nome}: {e}")
+            
+            # Verifica se há mais páginas
+            next_start_with = list_objects_response.data.next_start_with
+            if not next_start_with:
+                break
+                
+            print(f"Próxima página: {next_start_with}")
+        
+        print(f"\n📊 Processamento concluído!")
+        print(f"📁 Total de objetos analisados: {total_objetos}")
+        print(f"❌ Total de arquivos {extensao} com tamanho 0: {len(arquivos_zerados)}")
+        
+        if arquivos_zerados:
+            print(f"\n📋 Lista completa de arquivos zerados ({len(arquivos_zerados)} encontrados):")
+            for arquivo in arquivos_zerados:
+                print(f"  {arquivo}")
+        else:
+            print("✅ Nenhum arquivo zerado encontrado.")
+        
+        return arquivos_zerados
+        
+    except ServiceError as e:
+        print(f"❌ Erro na conexão com OCI: {e}")
+        return []
+
+# Configuração do OCI
+config = {
+    "user": "ocid1.user.oc1..aaaaaaaawgn2nn7vvsynzuswbz6mc6lfmsil5lkp4kpzfnwjllzsm4annulq",
+    "key_file": r"C:\Users\fecsantos\oci\felipe.costa@novaquest.com.br_2025-04-15T20_04_46.395Z.pem",
+    "fingerprint": "a6:5e:6f:37:62:de:80:8f:4a:eb:af:22:00:8b:3f:60",
+    "tenancy": "ocid1.tenancy.oc1..aaaaaaaa7ku32scdbd6dfdcb5k4336gbl4l3kcy3y2xd6jodhzx3eg5nm7qa",
+    "region": "sa-saopaulo-1"
+}
+
+# Parâmetros
+bucket_name = "BckOlosCloud"
+prefixo = "cloudWaySummary-202508"
+extensao = ".csv"
+
+# Executar verificação
+if __name__ == "__main__":
+    arquivos_zerados = verificar_arquivos_zerados_com_paginacao(config, bucket_name, prefixo, extensao)
