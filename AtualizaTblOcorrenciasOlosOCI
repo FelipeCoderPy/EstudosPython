@@ -1,0 +1,128 @@
+import pandas as pd
+import pyodbc
+import os
+import oci
+import mysql.connector
+
+# ================================
+# 1️⃣ GERA O CSV NA ÁREA DE TRABALHO
+# ================================
+
+# Caminho automático para a área de trabalho
+desktop_path = os.path.join(os.path.expanduser("~"), "Desktop", "OcorrenciasOlos-.csv")
+
+# Dados de conexão SQL Server
+servidor = '192.168.4.193'
+banco_de_dados = 'DePara'
+usuario_sql = 'fecsantos'
+senha_sql = 'dYAvWcBZe2GspzQZBIg1'
+driver = '{ODBC Driver 17 for SQL Server}'
+
+conexao_str = (
+    f'DRIVER={driver};'
+    f'SERVER={servidor};'
+    f'DATABASE={banco_de_dados};'
+    f'UID={usuario_sql};'
+    f'PWD={senha_sql};'
+)
+
+# Lendo a tabela
+conexao = pyodbc.connect(conexao_str)
+df = pd.read_sql_query('SELECT * FROM DePara.Geral.Tbl_Ocorrencias WITH (NOLOCK)', conexao)
+
+# Convertendo colunas com 0.0 e 1.0 para inteiros
+for col in df.columns:
+    if df[col].dropna().isin([0.0, 1.0]).all():
+        df[col] = df[col].astype('Int64')
+
+# Remove o arquivo anterior se existir
+if os.path.exists(desktop_path):
+    os.remove(desktop_path)
+
+# Exporta o CSV para a área de trabalho
+df.to_csv(desktop_path, index=False, sep=';', encoding='utf-8-sig')
+
+print(f"✅ Arquivo gerado com sucesso em: {desktop_path}")
+
+# Fecha a conexão SQL Server
+conexao.close()
+
+
+# ================================
+# 2️⃣ ENVIA PARA O OCI
+# ================================
+
+config = {
+    "user": "ocid1.user.oc1..aaaaaaaawgn2nn7vvsynzuswbz6mc6lfmsil5lkp4kpzfnwjllzsm4annulq",
+    "key_file": r"C:\Users\fecsantos\oci\felipe.costa@novaquest.com.br_2025-04-15T20_04_46.395Z.pem",
+    "fingerprint": "a6:5e:6f:37:62:de:80:8f:4a:eb:af:22:00:8b:3f:60",
+    "tenancy": "ocid1.tenancy.oc1..aaaaaaaa7ku32scdbd6dfdcb5k4336gbl4l3kcy3y2xd6jodhzx3eg5nm7qa",
+    "region": "sa-saopaulo-1"
+}
+
+bucket_name = "BckOlosCloud"
+local_directory = os.path.dirname(desktop_path)  # usa a própria pasta da área de trabalho
+
+object_storage = oci.object_storage.ObjectStorageClient(config)
+namespace = object_storage.get_namespace().data
+
+try:
+    for filename in os.listdir(local_directory):
+        file_path = os.path.join(local_directory, filename)
+
+        if os.path.isfile(file_path) and filename.startswith("OcorrenciasOlos-"):
+            with open(file_path, "rb") as f:
+                put_response = object_storage.put_object(
+                    namespace_name=namespace,
+                    bucket_name=bucket_name,
+                    object_name=filename,
+                    put_object_body=f
+                )
+                print(f"☁️ Arquivo '{filename}' enviado com sucesso. ETag: {put_response.headers.get('ETag')}")
+
+except oci.exceptions.ServiceError as e:
+    print(f"❌ Erro OCI: {e}")
+except FileNotFoundError:
+    print(f"❌ Diretório não encontrado: '{local_directory}'")
+except Exception as e:
+    print(f"❌ Erro inesperado: {e}")
+
+
+# ================================
+# 3️⃣ EXECUTA COMANDOS NO MYSQL
+# ================================
+
+source_config_mysql = {
+    'host': '172.25.100.14',
+    'database': 'DataHandling',
+    'user': 'fecsantos',
+    'password': '@Fec13022025'
+}
+
+try:
+    mysql_conn = mysql.connector.connect(**source_config_mysql)
+    mysql_cursor = mysql_conn.cursor()
+
+    print("✅ Conectado ao MySQL com sucesso.")
+
+    comandos = [
+        "ALTER TABLE Mapping.OcorrenciasOlos SECONDARY_UNLOAD;",
+        "ALTER TABLE Mapping.OcorrenciasOlos SECONDARY_LOAD;"
+    ]
+
+    for comando in comandos:
+        mysql_cursor.execute(comando)
+        print(f"✔ Executado: {comando}")
+
+    mysql_conn.commit()
+    print("✅ Comandos executados e confirmados com sucesso.")
+
+except mysql.connector.Error as err:
+    print(f"❌ Erro MySQL: {err}")
+
+finally:
+    if 'mysql_cursor' in locals():
+        mysql_cursor.close()
+    if 'mysql_conn' in locals() and mysql_conn.is_connected():
+        mysql_conn.close()
+        print("🔒 Conexão MySQL encerrada.")
