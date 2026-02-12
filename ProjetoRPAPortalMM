@@ -1,0 +1,206 @@
+import pyodbc
+import pymysql
+import pandas as pd
+import math
+import os
+import shutil
+import oci
+from datetime import datetime
+
+# ==================================================
+# CONFIGURAÇÕES – SQL SERVER
+# ==================================================
+
+sqlserver_conn_str = (
+    "DRIVER={ODBC Driver 17 for SQL Server};"
+    "SERVER=192.168.4.193;"
+    "DATABASE=db_portal_mm;"
+    "UID=fecsantos;"
+    "PWD=dYAvWcBZe2GspzQZBIg1"
+)
+
+# ==================================================
+# CONFIGURAÇÕES – MYSQL (HEATWAVE)
+# ==================================================
+
+mysql_config = {
+    "host": "168.75.81.183",
+    "user": "fecsantos",
+    "password": "@Fec13022025",
+    "database": "PortalMM",
+    "cursorclass": pymysql.cursors.Cursor
+}
+
+# ==================================================
+# CONFIGURAÇÕES – OCI OBJECT STORAGE
+# ==================================================
+
+oci_config = {
+    "user": "ocid1.user.oc1..aaaaaaaawgn2nn7vvsynzuswbz6mc6lfmsil5lkp4kpzfnwjllzsm4annulq",
+    "key_file": r"C:\Users\fecsantos\oci\felipe.costa@novaquest.com.br_2025-04-15T20_04_46.395Z.pem",
+    "fingerprint": "a6:5e:6f:37:62:de:80:8f:4a:eb:af:22:00:8b:3f:60",
+    "tenancy": "ocid1.tenancy.oc1..aaaaaaaa7ku32scdbd6dfdcb5k4336gbl4l3kcy3y2xd6jodhzx3eg5nm7qa",
+    "region": "sa-saopaulo-1"
+}
+
+bucket_name = "Portal_MM"
+
+# ==================================================
+# DIRETÓRIOS
+# ==================================================
+
+output_dir = r"\\192.168.4.50\mis\PortalMM"
+processed_dir = os.path.join(output_dir, "Processados")
+
+os.makedirs(output_dir, exist_ok=True)
+os.makedirs(processed_dir, exist_ok=True)
+
+# ==================================================
+# PARÂMETROS GERAIS
+# ==================================================
+
+batch_size = 200000
+timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+static_tables = [
+    "dp_CARTEIRA_MM",
+    "dp_LOG_PORTAL"
+]
+
+incremental_tables = [
+    "LOG_PORTAL",
+    "PLAN_ACESSOS_PORTAL_MM",
+    "PLAN_ACORDOS_PORTAL_MM",
+    "PLAN_EVENTO_PORTAL_MM"
+]
+
+heatwave_tables = incremental_tables.copy()
+
+# ==================================================
+# CONEXÕES
+# ==================================================
+
+sql_conn = pyodbc.connect(sqlserver_conn_str)
+mysql_conn = pymysql.connect(**mysql_config)
+
+# ==================================================
+# FUNÇÕES
+# ==================================================
+
+def get_max_created_at(table_name):
+    with mysql_conn.cursor() as cursor:
+        cursor.execute(f"SELECT MAX(createdAt) FROM {table_name}")
+        return cursor.fetchone()[0]
+
+def export_table(query, file_prefix):
+    df = pd.read_sql(query, sql_conn)
+
+    # Converte booleanos para 0/1
+    for col in df.select_dtypes(include="bool").columns:
+        df[col] = df[col].astype(int)
+
+    total_rows = len(df)
+    if total_rows == 0:
+        print(f"Nenhum dado para {file_prefix}")
+        return
+
+    num_batches = math.ceil(total_rows / batch_size)
+
+    for i in range(num_batches):
+        start = i * batch_size
+        end = start + batch_size
+        df_batch = df.iloc[start:end]
+
+        file_name = os.path.join(
+            output_dir,
+            f"{file_prefix}{'' if num_batches == 1 else f'_{i+1}'}.csv"
+        )
+
+        df_batch.to_csv(file_name, sep=";", index=False, encoding="utf-8")
+        print(f"Exportado: {file_name} ({start+1}-{min(end, total_rows)})")
+
+def upload_and_archive_files():
+    object_storage = oci.object_storage.ObjectStorageClient(oci_config)
+    namespace = object_storage.get_namespace().data
+
+    for filename in os.listdir(output_dir):
+        file_path = os.path.join(output_dir, filename)
+
+        if not os.path.isfile(file_path):
+            continue
+
+        try:
+            with open(file_path, "rb") as f:
+                object_storage.put_object(
+                    namespace_name=namespace,
+                    bucket_name=bucket_name,
+                    object_name=filename,
+                    put_object_body=f
+                )
+
+            print(f"Upload OK: {filename}")
+
+            shutil.move(
+                file_path,
+                os.path.join(processed_dir, filename)
+            )
+
+        except Exception as e:
+            print(f"Erro no upload {filename}: {e}")
+
+def refresh_heatwave_tables(tables):
+    with mysql_conn.cursor() as cursor:
+        for table in tables:
+            print(f"HeatWave refresh: {table}")
+            cursor.execute(f"ALTER TABLE {table} SECONDARY_UNLOAD;")
+            cursor.execute(f"ALTER TABLE {table} SECONDARY_LOAD;")
+    mysql_conn.commit()
+
+# ==================================================
+# EXPORTAÇÃO – TABELAS ESTÁTICAS
+# ==================================================
+
+for table in static_tables:
+    print(f"Exportando tabela estática: {table}")
+    export_table(f"SELECT * FROM dbo.{table}", f"{table}-")
+
+# ==================================================
+# EXPORTAÇÃO – TABELAS INCREMENTAIS
+# ==================================================
+
+for table in incremental_tables:
+    print(f"Exportando tabela incremental: {table}")
+
+    max_created_at = get_max_created_at(table)
+
+    if max_created_at:
+        query = f"""
+            SELECT *
+            FROM dbo.{table}
+            WHERE createdAt > '{max_created_at}'
+        """
+    else:
+        query = f"SELECT * FROM dbo.{table}"
+
+    export_table(query, f"{table}-{timestamp}")
+
+# ==================================================
+# UPLOAD OCI + MOVER PARA PROCESSADOS
+# ==================================================
+
+upload_and_archive_files()
+
+# ==================================================
+# REFRESH HEATWAVE
+# ==================================================
+
+refresh_heatwave_tables(heatwave_tables)
+
+# ==================================================
+# FINALIZAÇÃO
+# ==================================================
+
+sql_conn.close()
+mysql_conn.close()
+
+print("Processo finalizado com sucesso!")
