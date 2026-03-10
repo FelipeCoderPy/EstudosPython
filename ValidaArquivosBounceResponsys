@@ -1,0 +1,73 @@
+import csv
+import os
+
+
+diretorio = r"C:\Users\fecsantos\Desktop\Arquivos2"
+log_erro = "linhas_com_erro.txt"
+
+resultado = []
+linhas_erro = []
+
+for nome_arquivo in os.listdir(diretorio):
+
+    if not nome_arquivo.lower().endswith(".txt"):
+        continue
+
+    caminho_arquivo = os.path.join(diretorio, nome_arquivo)
+
+    esperado_colunas = None
+    erro_no_arquivo = False
+
+    try:
+        with open(caminho_arquivo, "r", encoding="utf-8", newline="") as f:
+
+            reader = csv.reader(f, delimiter=",", quotechar='"')
+
+            for num_linha, row in enumerate(reader, 1):
+
+                linha_original = ",".join(row)
+
+                if '\\"' in linha_original:
+                    linhas_erro.append((nome_arquivo, num_linha, "ESCAPE_INVALIDO", linha_original))
+                    erro_no_arquivo = True
+
+                if esperado_colunas is None:
+                    esperado_colunas = len(row)
+
+                if len(row) != esperado_colunas:
+                    linhas_erro.append((nome_arquivo, num_linha, "NUMERO_COLUNAS_INVALIDO", linha_original))
+                    erro_no_arquivo = True
+
+        # Verificar aspas desbalanceadas
+        with open(caminho_arquivo, "r", encoding="utf-8") as f:
+
+            for num_linha, linha in enumerate(f, 1):
+
+                if linha.count('"') % 2 != 0:
+                    linhas_erro.append((nome_arquivo, num_linha, "ASPAS_DESBALANCEADAS", linha.strip()))
+                    erro_no_arquivo = True
+
+        if erro_no_arquivo:
+            resultado.append(f"{nome_arquivo} -> ERRO ENCONTRADO")
+        else:
+            resultado.append(f"{nome_arquivo} -> OK")
+
+    except Exception as e:
+        resultado.append(f"{nome_arquivo} -> ERRO DE LEITURA: {str(e)}")
+
+
+# Salvar log detalhado
+with open(log_erro, "w", encoding="utf-8") as log:
+
+    for erro in linhas_erro:
+        log.write(f"Arquivo {erro[0]} | Linha {erro[1]} | {erro[2]} | {erro[3]}\n")
+
+
+print("===================================")
+print("RESULTADO DA VALIDAÇÃO DOS ARQUIVOS")
+print("===================================")
+
+for r in resultado:
+    print(r)
+
+print("\nLog detalhado salvo em:", log_erro)
