@@ -1,0 +1,91 @@
+import paramiko
+import oci
+from concurrent.futures import ThreadPoolExecutor
+
+# =========================
+# CONFIG
+# =========================
+SFTP_HOST = "fs-novaquest-integration-grlrlyadr9dh-gr.integration.sa-saopaulo-1.ocp.oraclecloud.com"
+SFTP_PORT = 10196
+SFTP_USER = "Olos"
+ARQUIVO_CHAVE = r"C:\Users\fecsantos\FileZilla\Olos-Private"
+
+CAMINHO_REMOTO = "/home/users/olos/Cloud"
+bucket_name = "BckOlosCloud"
+
+# OCI
+config = {
+    "user": "ocid1.user.oc1..aaaaaaaawgn2nn7vvsynzuswbz6mc6lfmsil5lkp4kpzfnwjllzsm4annulq",
+    "key_file": r"C:\Users\fecsantos\oci\felipe.costa@novaquest.com.br_2025-04-15T20_04_46.395Z.pem",
+    "fingerprint": "a6:5e:6f:37:62:de:80:8f:4a:eb:af:22:00:8b:3f:60",
+    "tenancy": "ocid1.tenancy.oc1..aaaaaaaa7ku32scdbd6dfdcb5k4336gbl4l3kcy3y2xd6jodhzx3eg5nm7qa",
+    "region": "sa-saopaulo-1"
+}
+
+# =========================
+# CONEXÕES
+# =========================
+def criar_sftp():
+    try:
+        key = paramiko.Ed25519Key.from_private_key_file(ARQUIVO_CHAVE)
+    except:
+        key = paramiko.ECDSAKey.from_private_key_file(ARQUIVO_CHAVE)
+
+    transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+    transport.connect(username=SFTP_USER, pkey=key)
+    return paramiko.SFTPClient.from_transport(transport), transport
+
+object_storage = oci.object_storage.ObjectStorageClient(config)
+namespace = object_storage.get_namespace().data
+
+# =========================
+# FUNÇÃO DE UPLOAD
+# =========================
+def processar_arquivo(arquivo):
+
+    sftp, transport = criar_sftp()
+
+    nome = arquivo.filename
+    caminho = f"{CAMINHO_REMOTO}/{nome}"
+
+    try:
+        print(f" Enviando: {nome} ({arquivo.st_size} bytes)")
+
+        with sftp.open(caminho, "rb") as f:
+            object_storage.put_object(namespace, bucket_name, nome, f)
+
+        print(f" Upload OK: {nome}")
+
+        sftp.remove(caminho)
+        print(f" Deletado: {nome}")
+
+    except Exception as e:
+        print(f" Erro em {nome}: {e}")
+
+    finally:
+        sftp.close()
+        transport.close()
+
+# =========================
+# MAIN
+# =========================
+sftp_main, transport_main = criar_sftp()
+
+arquivos = sftp_main.listdir_attr(CAMINHO_REMOTO)
+arquivos_csv = [f for f in arquivos if f.filename.lower().endswith(".csv")]
+
+# ordena menor → maior
+arquivos_ordenados = sorted(arquivos_csv, key=lambda x: x.st_size)
+
+sftp_main.close()
+transport_main.close()
+
+print(f"Total arquivos: {len(arquivos_ordenados)}")
+
+#  paralelismo (ajuste aqui)
+MAX_THREADS = 4
+
+with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+    executor.map(processar_arquivo, arquivos_ordenados)
+
+print("Concluído!")
