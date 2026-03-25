@@ -1,0 +1,19 @@
+import duckdb as ddb
+import pandas as pd
+
+pd.set_option('display.max_rows', 500000)
+
+arquivo = r"C:\Users\fecsantos\Desktop\Arquivos2\cloudAttemptsRawData-*.csv"
+
+ddb.query(f"""
+    SELECT 
+        regexp_extract('{arquivo}', '[^\\\\]+$') AS nome_arquivo,
+        max(StartDate) AS MaxData,
+        min(StartDate) AS MinData,        
+        date(StartDate) AS Data,
+        hour(StartDate) AS Hora,
+        count(*) AS total
+    FROM read_csv_auto('{arquivo}', ignore_errors=true) a
+    GROUP BY date(StartDate), hour(StartDate)
+    ORDER BY Data, Hora ASC
+""").to_df()
