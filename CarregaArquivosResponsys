@@ -1,0 +1,162 @@
+import oci
+import os
+from datetime import datetime, timedelta
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+# =========================
+# CONFIG OCI
+# =========================
+config = {
+    "user": "ocid1.user.oc1..aaaaaaaawgn2nn7vvsynzuswbz6mc6lfmsil5lkp4kpzfnwjllzsm4annulq",
+    "key_file": r"C:\Users\fecsantos\oci\felipe.costa@novaquest.com.br_2025-04-15T20_04_46.395Z.pem",
+    "fingerprint": "a6:5e:6f:37:62:de:80:8f:4a:eb:af:22:00:8b:3f:60",
+    "tenancy": "ocid1.tenancy.oc1..aaaaaaaa7ku32scdbd6dfdcb5k4336gbl4l3kcy3y2xd6jodhzx3eg5nm7qa",
+    "region": "sa-saopaulo-1"
+}
+
+bucket_name = "ResponsysBucket"
+
+object_storage = oci.object_storage.ObjectStorageClient(config)
+namespace = object_storage.get_namespace().data
+
+# =========================
+# DATA
+# =========================
+hoje_str = (datetime.now() - timedelta(days=0)).strftime("%Y%m%d")
+
+# =========================
+# LISTAR BUCKET (CACHE)
+# =========================
+def listar_arquivos_bucket():
+    objetos = set()
+    start = None
+
+    while True:
+        response = object_storage.list_objects(
+            namespace_name=namespace,
+            bucket_name=bucket_name,
+            start=start
+        )
+
+        for obj in response.data.objects:
+            objetos.add(obj.name)
+
+        if response.data.next_start_with:
+            start = response.data.next_start_with
+        else:
+            break
+
+    return objetos
+
+
+arquivos_no_bucket = listar_arquivos_bucket()
+print(f"Arquivos já no bucket: {len(arquivos_no_bucket)}")
+
+
+# =========================
+# UPLOAD COM RETRY
+# =========================
+def upload_com_retry(file_path, object_name, tentativas=3):
+    for tentativa in range(1, tentativas + 1):
+        try:
+            with open(file_path, "rb") as f:
+                object_storage.put_object(
+                    namespace_name=namespace,
+                    bucket_name=bucket_name,
+                    object_name=object_name,
+                    put_object_body=f
+                )
+            return True
+
+        except Exception as e:
+            print(f"[RETRY {tentativa}] {object_name}: {e}")
+            time.sleep(2)
+
+    return False
+
+
+# =========================
+# PROCESSAMENTO PARA THREAD
+# =========================
+def processar_arquivo(file_path, filename):
+    try:
+        # filtro por data
+        if hoje_str not in filename:
+            return
+
+        # valida bucket
+        if filename in arquivos_no_bucket:
+            print(f"[SKIP] {filename}")
+            return
+
+        inicio = time.time()
+
+        sucesso = upload_com_retry(file_path, filename)
+
+        if not sucesso:
+            print(f"[ERRO FINAL] {filename}")
+            return
+
+        tempo = time.time() - inicio
+
+        print(f"[ENVIADO] {filename} ({tempo:.2f}s)")
+
+        # atualiza cache
+        arquivos_no_bucket.add(filename)
+
+    except Exception as e:
+        print(f"[ERRO THREAD] {filename}: {e}")
+
+
+# =========================
+# EXECUÇÃO PARALELA
+# =========================
+def enviar_diretorio(local_directory):
+    try:
+        arquivos = [
+            (os.path.join(local_directory, f), f)
+            for f in os.listdir(local_directory)
+            if os.path.isfile(os.path.join(local_directory, f))
+        ]
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            executor.map(lambda x: processar_arquivo(*x), arquivos)
+
+    except Exception as e:
+        print(f"[ERRO DIRETÓRIO] {local_directory}: {e}")
+
+
+# =========================
+# DIRETÓRIOS
+# =========================
+diretorios = [
+    r'\\192.168.4.6\SFTP-Oracle-Download\SMS\SENT',
+    r'\\192.168.4.6\SFTP-Oracle-Download\SMS\CLICK'
+    r'\\192.168.4.6\SFTP-Oracle-Download\SMS\DELIVERED',
+    r'\\192.168.4.6\SFTP-Oracle-Download\SMS\FAIL',
+    r'\\192.168.4.6\SFTP-Oracle-Download\SMS\OPT_IN',
+    r'\\192.168.4.6\SFTP-Oracle-Download\SMS\SKIPPED',
+    r'\\192.168.4.6\SFTP-Oracle-Download\EMAIL\SKIPPED',
+    r'\\192.168.4.6\SFTP-Oracle-Download\EMAIL\SENT',
+    r'\\192.168.4.6\SFTP-Oracle-Download\EMAIL\OPT_OUT',
+    r'\\192.168.4.6\SFTP-Oracle-Download\EMAIL\OPT_IN',
+    r'\\192.168.4.6\SFTP-Oracle-Download\EMAIL\OPEN',
+    r'\\192.168.4.6\SFTP-Oracle-Download\EMAIL\CLICK',
+    r'\\192.168.4.6\SFTP-Oracle-Download\EMAIL\BOUNCE',
+    r'\\192.168.4.6\SFTP-Oracle-Download\EMAIL\AUTO_OPEN',
+    r'\\192.168.4.6\SFTP-Oracle-Download\EMAIL\FAIL',
+    r'\\192.168.4.6\SFTP-Oracle-Download\DEMAIS\FORM',
+    r'\\192.168.4.6\SFTP-Oracle-Download\DEMAIS\LAUNCH',
+    r'\\192.168.4.6\SFTP-Oracle-Download\PROGRAM\STATE',
+    r'\\192.168.4.6\SFTP-Oracle-Download\DYNAMIC\CONTENT'
+]
+
+# =========================
+# EXECUÇÃO
+# =========================
+for dir in diretorios:
+    print(f"\n📂 Processando: {dir}")
+    enviar_diretorio(dir)
+
+print("\n✅ Concluído!")
