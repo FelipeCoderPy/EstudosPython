@@ -1,0 +1,287 @@
+import paramiko
+import oci
+import io
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock, Semaphore
+from tqdm import tqdm
+
+# =========================
+# CONFIGURAÇÕES
+# =========================
+SFTP_HOST = "fs-novaquest-integration-grlrlyadr9dh-gr.integration.sa-saopaulo-1.ocp.oraclecloud.com"
+SFTP_PORT = 10196
+SFTP_USER = "Olos"
+ARQUIVO_CHAVE = r"C:\Users\fecsantos\FileZilla\Olos-Private"
+CAMINHO_REMOTO = "/home/users/olos/Cloud"
+
+OCI_CONFIG = {
+    "user": "ocid1.user.oc1..aaaaaaaawgn2nn7vvsynzuswbz6mc6lfmsil5lkp4kpzfnwjllzsm4annulq",
+    "key_file": r"C:\Users\fecsantos\oci\felipe.costa@novaquest.com.br_2025-04-15T20_04_46.395Z.pem",
+    "fingerprint": "a6:5e:6f:37:62:de:80:8f:4a:eb:af:22:00:8b:3f:60",
+    "tenancy": "ocid1.tenancy.oc1..aaaaaaaa7ku32scdbd6dfdcb5k4336gbl4l3kcy3y2xd6jodhzx3eg5nm7qa",
+    "region": "sa-saopaulo-1"
+}
+
+BUCKET_NAME = "BckOlosCloud"
+
+# =========================
+# PARÂMETROS DE PERFORMANCE
+# =========================
+MAX_WORKERS = 12  # Comece com 10, aumente até 20 se a rede aguentar
+MAX_RETRIES = 3
+RETRY_DELAY = 2
+
+# Configuração do loop infinito
+WAIT_BETWEEN_CYCLES = 3  # segundos de espera entre cada execução
+
+# =========================
+# GERENCIADOR DE CONEXÕES SFTP (Thread-Safe)
+# =========================
+class SFTPConnectionPool:
+    def __init__(self, max_connections=12):
+        self.max_connections = max_connections
+        self.pool = []
+        self.lock = Lock()
+        self.semaphore = Semaphore(max_connections)
+        
+    def _create_connection(self):
+        """Cria uma nova conexão SFTP"""
+        try:
+            key = paramiko.Ed25519Key.from_private_key_file(ARQUIVO_CHAVE)
+        except:
+            key = paramiko.ECDSAKey.from_private_key_file(ARQUIVO_CHAVE)
+        
+        transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+        transport.connect(username=SFTP_USER, pkey=key)
+        return paramiko.SFTPClient.from_transport(transport)
+    
+    def get_connection(self):
+        """Pega uma conexão do pool ou cria uma nova"""
+        self.semaphore.acquire()
+        with self.lock:
+            if self.pool:
+                return self.pool.pop()
+        return self._create_connection()
+    
+    def return_connection(self, conn):
+        """Devolve a conexão ao pool"""
+        with self.lock:
+            self.pool.append(conn)
+        self.semaphore.release()
+    
+    def close_all(self):
+        """Fecha todas as conexões (uso no final)"""
+        with self.lock:
+            for conn in self.pool:
+                try:
+                    conn.close()
+                except:
+                    pass
+            self.pool.clear()
+
+# =========================
+# UPLOAD COM STREAMING (EVITA CARREGAR TUDO EM RAM)
+# =========================
+def upload_to_oci(object_storage, namespace, bucket_name, file_name, sftp, remote_path):
+    """
+    Faz upload usando streaming - igual ao código antigo mas thread-safe
+    """
+    with sftp.open(remote_path, "rb") as remote_file:
+        object_storage.put_object(
+            namespace,
+            bucket_name,
+            file_name,
+            remote_file  # ← Streaming! Não carrega tudo na RAM
+        )
+
+# =========================
+# PROCESSAMENTO INDIVIDUAL (Thread-Safe)
+# =========================
+def process_file(file_info, pool, object_storage, namespace):
+    """Processa um único arquivo - seguro para threads"""
+    nome_arquivo = file_info.filename
+    tamanho = file_info.st_size
+    caminho_remoto = f"{CAMINHO_REMOTO}/{nome_arquivo}"
+    
+    sftp_conn = None
+    
+    for tentativa in range(1, MAX_RETRIES + 1):
+        try:
+            # Pega uma conexão do pool
+            sftp_conn = pool.get_connection()
+            
+            # Upload com streaming (seguro e econômico)
+            upload_to_oci(object_storage, namespace, BUCKET_NAME, nome_arquivo, sftp_conn, caminho_remoto)
+            
+            # SÓ DELETA SE O UPLOAD FUNCIONOU (mesma segurança do código antigo)
+            sftp_conn.remove(caminho_remoto)
+            
+            # Devolve a conexão ao pool
+            pool.return_connection(sftp_conn)
+            
+            return (nome_arquivo, tamanho, True, None)
+            
+        except Exception as e:
+            # Se falhou, devolve a conexão mesmo assim
+            if sftp_conn:
+                pool.return_connection(sftp_conn)
+                sftp_conn = None
+            
+            if tentativa < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+            else:
+                return (nome_arquivo, tamanho, False, str(e))
+    
+    return (nome_arquivo, tamanho, False, "Unknown error")
+
+# =========================
+# MAIN
+# =========================
+def main():
+    print("="*60)
+    print("🚀 INICIANDO TRANSFERÊNCIA PARALELA SEGURA")
+    print("="*60)
+    
+    # 1. Conexão inicial para listar arquivos
+    print("\n📡 Conectando ao SFTP...")
+    initial_pool = SFTPConnectionPool(max_connections=1)
+    sftp_list = initial_pool.get_connection()
+    
+    arquivos = sftp_list.listdir_attr(CAMINHO_REMOTO)
+    initial_pool.return_connection(sftp_list)
+    
+    # Filtra e ordena (menores primeiro para liberar slots rápido)
+    arquivos_csv = [f for f in arquivos if f.filename.lower().endswith(".csv")]
+    arquivos_ordenados = sorted(arquivos_csv, key=lambda x: x.st_size)
+    
+    total = len(arquivos_ordenados)
+    tamanho_total = sum(f.st_size for f in arquivos_ordenados) / (1024*1024)
+    
+    print(f"📁 Encontrados: {total} arquivos CSV")
+    print(f"💾 Tamanho total: {tamanho_total:.2f} MB")
+    
+    if total == 0:
+        print("✅ Nada para processar!")
+        return 0  # Retorna 0 quando não tem nada pra fazer
+    
+    # 2. Prepara OCI
+    print("\n☁️ Conectando ao OCI...")
+    object_storage = oci.object_storage.ObjectStorageClient(OCI_CONFIG)
+    namespace = object_storage.get_namespace().data
+    
+    # 3. Pool de conexões SFTP
+    print(f"🔌 Criando pool com {MAX_WORKERS} conexões...")
+    pool = SFTPConnectionPool(max_connections=MAX_WORKERS)
+    
+    # 4. Processamento paralelo
+    print("\n⚡ INICIANDO TRANSFERÊNCIAS PARALELAS")
+    print("-"*60)
+    
+    inicio = time.time()
+    sucessos = 0
+    erros = []
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submete todas as tarefas
+        futures = {
+            executor.submit(process_file, arquivo, pool, object_storage, namespace): arquivo
+            for arquivo in arquivos_ordenados
+        }
+        
+        # Barra de progresso
+        with tqdm(total=total, unit="arquivo", desc="Transferindo", unit_scale=True) as pbar:
+            for future in as_completed(futures):
+                nome, tamanho, sucesso, erro = future.result()
+                
+                if sucesso:
+                    sucessos += 1
+                    pbar.set_postfix({
+                        "OK": sucessos,
+                        "Falhas": len(erros),
+                        "MB/s": f"{(sucessos * tamanho / (1024*1024)) / (time.time() - inicio):.1f}" if sucessos > 0 else "0"
+                    })
+                else:
+                    erros.append((nome, erro))
+                    pbar.set_postfix({"OK": sucessos, "Falhas": len(erros)})
+                
+                pbar.update(1)
+    
+    # 5. Estatísticas finais
+    elapsed = time.time() - inicio
+    velocidade_mb = tamanho_total / elapsed if elapsed > 0 else 0
+    
+    print("\n" + "="*60)
+    print("📊 RELATÓRIO FINAL")
+    print("="*60)
+    print(f"✅ Sucessos: {sucessos}/{total}")
+    print(f"❌ Falhas:   {len(erros)}")
+    print(f"⏱️  Tempo:    {elapsed:.1f} segundos")
+    print(f"🚀 Velocidade: {velocidade_mb:.2f} MB/s")
+    print(f"⚡ Ganho:    ~{MAX_WORKERS}x comparado ao código antigo (teórico)")
+    
+    if erros:
+        print("\n⚠️  ARQUIVOS COM ERRO:")
+        for nome, erro in erros[:10]:  # Mostra só os 10 primeiros
+            print(f"   • {nome}: {erro}")
+        if len(erros) > 10:
+            print(f"   ... e mais {len(erros)-10} arquivos")
+    
+    # 6. Limpeza
+    print("\n🧹 Fechando conexões...")
+    pool.close_all()
+    
+    print("\n✨ PROCESSO CONCLUÍDO!")
+    
+    if erros:
+        print("\n💡 Dica: Execute novamente, os arquivos com erro ainda estão no SFTP")
+        return 1
+    return 0
+
+# =========================
+# LOOP INFINITO
+# =========================
+def run_forever():
+    """
+    Executa o processo em loop infinito, com wait de 3 segundos entre cada execução
+    """
+    cycle_count = 0
+    
+    while True:
+        cycle_count += 1
+        
+        print("\n" + "="*70)
+        print(f"🔄 INICIANDO CICLO #{cycle_count}")
+        print("="*70)
+        print(f"⏰ {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        try:
+            # Executa o processo principal
+            result = main()
+            
+            if result == 0:
+                print(f"\n✅ Ciclo #{cycle_count} concluído com sucesso!")
+            else:
+                print(f"\n⚠️  Ciclo #{cycle_count} concluído com falhas em alguns arquivos")
+                
+        except KeyboardInterrupt:
+            print("\n\n⚠️  Interrupção manual detectada. Encerrando...")
+            break
+            
+        except Exception as e:
+            print(f"\n❌ ERRO CRÍTICO no ciclo #{cycle_count}: {e}")
+            print("Continuando mesmo assim...")
+        
+        # Aguarda 3 segundos antes de reiniciar
+        print(f"\n⏳ Aguardando {WAIT_BETWEEN_CYCLES} segundos antes do próximo ciclo...")
+        print("-"*70)
+        
+        try:
+            time.sleep(WAIT_BETWEEN_CYCLES)
+        except KeyboardInterrupt:
+            print("\n\n⚠️  Interrupção manual detectada. Encerrando...")
+            break
+
+if __name__ == "__main__":
+    # Executa em loop infinito
+    run_forever()
