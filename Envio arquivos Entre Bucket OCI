@@ -1,0 +1,194 @@
+import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import oci
+from oci.exceptions import ServiceError
+
+# ================================
+# CONFIGURAÇÕES
+# ================================
+config = {
+    "user": "ocid1.user.oc1..aaaaaaaawgn2nn7vvsynzuswbz6mc6lfmsil5lkp4kpzfnwjllzsm4annulq",
+    "key_file": r"C:\Users\fecsantos\oci\felipe.costa@novaquest.com.br_2025-04-15T20_04_46.395Z.pem",
+    "fingerprint": "a6:5e:6f:37:62:de:80:8f:4a:eb:af:22:00:8b:3f:60",
+    "tenancy": "ocid1.tenancy.oc1..aaaaaaaa7ku32scdbd6dfdcb5k4336gbl4l3kcy3y2xd6jodhzx3eg5nm7qa",
+    "region": "sa-saopaulo-1",
+}
+
+bucket_origem = "BackupOlosCloud"
+bucket_destino = "unity-test-claudio"
+prefixo = "cloudInboundRawData-202605"
+
+restore_hours = 24      # por quanto tempo o objeto fica restaurado (não é o tempo até restaurar)
+WORKERS = 30            # threads para restore / verificação / cópia
+INTERVALO_RESTORE = 60  # segundos entre rodadas de verificação de restore
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("oci_copy")
+
+# ================================
+# CLIENTE POR THREAD (com retry)
+# ================================
+_local = threading.local()
+
+def cliente() -> oci.object_storage.ObjectStorageClient:
+    c = getattr(_local, "c", None)
+    if c is None:
+        c = oci.object_storage.ObjectStorageClient(
+            config, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY
+        )
+        _local.c = c
+    return c
+
+namespace = oci.object_storage.ObjectStorageClient(config).get_namespace().data
+
+# ================================
+# LISTAR POR PREFIXO (paginado)
+# ================================
+def listar_arquivos() -> list[str]:
+    arquivos, start = [], None
+    while True:
+        resp = cliente().list_objects(namespace, bucket_origem, prefix=prefixo, start=start)
+        arquivos.extend(o.name for o in resp.data.objects)
+        start = resp.data.next_start_with
+        if not start:
+            break
+    log.info("Objetos encontrados com o prefixo: %d", len(arquivos))
+    return arquivos
+
+# ================================
+# ESTADO / RESTORE / CÓPIA
+# ================================
+def estado_objeto(nome: str) -> str:
+    """PRONTO (não arquivado ou já restaurado) | RESTAURANDO | ARQUIVADO."""
+    h = cliente().head_object(namespace, bucket_origem, nome).headers
+    arch = (h.get("archival-state") or "").strip()   # '', Archived, Restoring, Restored
+    if arch in ("", "Restored"):
+        return "PRONTO"
+    if arch == "Restoring":
+        return "RESTAURANDO"
+    return "ARQUIVADO"
+
+def solicitar_restore(nome: str) -> None:
+    try:
+        cliente().restore_objects(
+            namespace, bucket_origem,
+            oci.object_storage.models.RestoreObjectsDetails(object_name=nome, hours=restore_hours),
+        )
+    except ServiceError as e:
+        # 409 = já restaurado ou restore em andamento: ok para o nosso fluxo
+        if e.status != 409:
+            log.error("Erro no restore de %s: %s %s", nome, e.status, e.code)
+
+def existe_no_destino(nome: str) -> bool:
+    try:
+        cliente().head_object(namespace, bucket_destino, nome)
+        return True
+    except ServiceError as e:
+        if e.status == 404:
+            return False
+        raise
+
+def copiar(nome: str) -> bool:
+    try:
+        if existe_no_destino(nome):          # idempotência: não recopia
+            return True
+        cliente().copy_object(
+            namespace, bucket_origem,
+            oci.object_storage.models.CopyObjectDetails(
+                source_object_name=nome,
+                destination_region=config["region"],
+                destination_namespace=namespace,
+                destination_bucket=bucket_destino,
+                destination_object_name=nome,
+            ),
+        )
+        return True
+    except ServiceError as e:
+        log.error("Erro ao copiar %s: %s %s %s", nome, e.status, e.code, e.message)
+        return False
+
+# ================================
+# EXECUÇÃO
+# ================================
+def em_paralelo(fn, itens, desc):
+    ok, err = 0, 0
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs = {ex.submit(fn, n): n for n in itens}
+        for f in as_completed(futs):
+            if f.result():
+                ok += 1
+            else:
+                err += 1
+    log.info("%s -> ok=%d err=%d", desc, ok, err)
+    return ok, err
+
+if __name__ == "__main__":
+    log.info("Origem=%s | Destino=%s | Prefixo=%s", bucket_origem, bucket_destino, prefixo)
+
+    arquivos = listar_arquivos()
+    if not arquivos:
+        log.warning("Nenhum arquivo encontrado.")
+        raise SystemExit
+
+    # 1) Descobre o estado de todos em paralelo
+    estados: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs = {ex.submit(estado_objeto, n): n for n in arquivos}
+        for f in as_completed(futs):
+            estados[futs[f]] = f.result()
+
+    prontos = [n for n, s in estados.items() if s == "PRONTO"]
+    arquivados = [n for n, s in estados.items() if s in ("ARQUIVADO", "RESTAURANDO")]
+    log.info("Prontos para copiar: %d | Em Archive (precisam restore): %d",
+             len(prontos), len(arquivados))
+
+    # 2) Copia já os que estão prontos (não espera o Archive)
+    if prontos:
+        log.info("Copiando os que já estão disponíveis...")
+        em_paralelo(copiar, prontos, "Cópia (prontos)")
+
+    # 3) Solicita restore do que está em Archive (em paralelo)
+    if arquivados:
+        log.info("Solicitando restore de %d objeto(s)...", len(arquivados))
+        em_paralelo(lambda n: (solicitar_restore(n) or True), arquivados, "Restore solicitado")
+
+        # 4) Aguarda a restauração (o Archive leva ~1h — isso é da OCI)
+        pendentes = set(arquivados)
+        while pendentes:
+            prontos_agora = set()
+            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                futs = {ex.submit(estado_objeto, n): n for n in pendentes}
+                for f in as_completed(futs):
+                    if f.result() == "PRONTO":
+                        prontos_agora.add(futs[f])
+            pendentes -= prontos_agora
+            log.info("Restaurados nesta rodada: %d | Ainda pendentes: %d",
+                     len(prontos_agora), len(pendentes))
+            if pendentes:
+                time.sleep(INTERVALO_RESTORE)
+
+        # 5) Copia os restaurados
+        log.info("Copiando os objetos restaurados...")
+        em_paralelo(copiar, arquivados, "Cópia (restaurados)")
+
+    # 6) Verificação final: confere o que realmente chegou no destino
+    log.info("Verificando presença no destino...")
+    faltando = []
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs = {ex.submit(existe_no_destino, n): n for n in arquivos}
+        for f in as_completed(futs):
+            if not f.result():
+                faltando.append(futs[f])
+
+    log.info("===== RESUMO =====")
+    log.info("Total no prefixo : %d", len(arquivos))
+    log.info("Confirmados no destino: %d", len(arquivos) - len(faltando))
+    log.info("Faltando: %d", len(faltando))
+    if faltando:
+        for n in faltando[:20]:
+            log.warning("  não confirmado: %s", n)
+        log.warning("  (a cópia é assíncrona; rode de novo em instantes para os faltantes — "
+                    "é idempotente e só copia o que falta)")
